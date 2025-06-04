@@ -198,19 +198,21 @@ func handleConnection(conn net.Conn, db *database.DataStore) {
 					validSyntax := true
 					// Basic syntax checks for queuing based on common argument counts
 					switch cmdUpper {
-					case "SET": if len(parsedArgs) < 2 { validSyntax = false } // Allows options
-					case "GET", "DECR", "INCR", "TTL", "PTTL", "TYPE", "SAVE", "UNWATCH": if len(parsedArgs) != 1 && cmdUpper != "SAVE" && cmdUpper != "UNWATCH" { validSyntax = false } else if (cmdUpper == "SAVE" || cmdUpper == "UNWATCH") && len(parsedArgs) !=0 {validSyntax = false}
+					case "SET": // SET key value [NX|XX] [GET] - min 2 args for SET key value
+						if len(parsedArgs) < 2 { validSyntax = false }
+					case "GET", "DECR", "INCR", "TTL", "PTTL", "TYPE": if len(parsedArgs) != 1 { validSyntax = false }
+					case "SAVE", "UNWATCH": if len(parsedArgs) !=0 {validSyntax = false}
 					case "XADD": if len(parsedArgs) < 3 || (len(parsedArgs)-2)%2 != 0 { validSyntax = false }
 					case "HSET": if len(parsedArgs) != 3 {validSyntax = false}
 					case "HGET": if len(parsedArgs) != 2 {validSyntax = false}
 					case "HDEL": if len(parsedArgs) < 2 {validSyntax = false}
 					case "DEL": if len(parsedArgs) == 0 {validSyntax = false}
 					case "PING": if len(parsedArgs) > 1 {validSyntax = false}
-					case "ECHO", "EXPIRE", "PEXPIRE", "INCRBY", "DECRBY", "SQUERY": if len(parsedArgs) != 2 && cmdUpper != "SQUERY" { validSyntax = false } else if cmdUpper == "SQUERY" && len(parsedArgs) !=2 {validSyntax = false} // SQUERY needs 2, others here mostly 2
+					case "ECHO": if len(parsedArgs) != 1 {validSyntax = false}
+					case "EXPIRE", "PEXPIRE", "INCRBY", "DECRBY", "SQUERY": if len(parsedArgs) != 2 { validSyntax = false }
 					case "REPLICAOF": if len(parsedArgs) != 2 {validSyntax=false}
-					// WATCH (already handled), MULTI, EXEC, DISCARD are not queued this way.
 					}
-					if !validSyntax { clientState.transactionFailed = true } // Mark TX as failed for EXECABORT
+					if !validSyntax { clientState.transactionFailed = true }
 					clientState.queuedCommands = append(clientState.queuedCommands, QueuedCommand{ Name: cmdUpper, Args: parsedArgs, Raw: request })
 					conn.Write(redis.SerializeResponse("QUEUED"))
 				} else {
@@ -231,7 +233,7 @@ func handleConnection(conn net.Conn, db *database.DataStore) {
 
 		if isMasterConnection && commandName != "REPLICAOF" && commandName != "INTERNAL_REGISTER_SLAVE" {
 			switch commandName {
-			case "SET": if len(args) >= 2 { db.Set(args[0], args[1], database.SetOptions{}) } // Basic set for replication
+			case "SET": if len(args) >= 2 { db.Set(args[0], args[1], database.SetOptions{}) }
 			case "XADD": if len(args) >= 3 { _, _ = database.XAdd(db, args[0], args[1], parseFields(args[2:])) }
 			case "HSET": if len(args) == 3 { _, _ = db.HSet(args[0], args[1], args[2]) }
 			case "HDEL": if len(args) >=2 { _, _ = db.HDel(args[0], args[1:]...) }
@@ -242,9 +244,7 @@ func handleConnection(conn net.Conn, db *database.DataStore) {
 			case "DECRBY": if len(args) == 2 { decr, _ := strconv.ParseInt(args[1], 10, 64); _, _ = db.Incr(args[0], -decr) }
 			case "EXPIRE": if len(args) == 2 { secs, _ := strconv.ParseInt(args[1], 10, 64); _, _ = db.Expire(args[0], secs) }
 			case "PEXPIRE": if len(args) == 2 { msecs, _ := strconv.ParseInt(args[1], 10, 64); _, _ = db.Pexpire(args[0], msecs) }
-			// Read-only commands or commands not modifying keys directly (like PING, ECHO, MULTI, EXEC) are handled by slave as normal client.
 			}
-			// If it was a write command that was processed, skip sending response from slave to master
 			if commandName == "SET" || commandName == "XADD" || commandName == "HSET" || commandName == "HDEL" || commandName == "DEL" ||
 			   commandName == "INCR" || commandName == "DECR" || commandName == "INCRBY" || commandName == "DECRBY" ||
 			   commandName == "EXPIRE" || commandName == "PEXPIRE" {
@@ -346,32 +346,23 @@ func handleConnection(conn net.Conn, db *database.DataStore) {
 				if clientState.transactionFailed { response = fmt.Errorf("EXECABORT Transaction discarded because of previous errors") } else {
 					execResponses := make([]interface{}, len(clientState.queuedCommands))
 					keysModifiedInTx := make(map[string]struct{})
-					originalCmdsToPropagate := make([][]byte, 0, len(clientState.queuedCommands)+2)
-
+					// commandsToPropagate for EXEC should be built based on original transaction commands
 					if serverState.role == RoleMaster && len(clientState.queuedCommands) > 0 {
-						// For propagation, assume MULTI was the first raw command if we had stored it for the transaction.
-						// For now, reconstruct MULTI.
-						multiRaw, _ := redis.ParseCommand([]byte("*1\r\n$5\r\nMULTI\r\n")) // This is not right for propagation
-                                                                                                // We need the *original* raw MULTI.
-                                                                                                // Let's just send the queued commands' raw bytes for now.
-                        // commandsToPropagate = append(commandsToPropagate, clientState.MULTI_RAW_BYTES_IF_STORED)
+						commandsToPropagate = append(commandsToPropagate, []byte("*1\r\n$5\r\nMULTI\r\n")) // Placeholder for actual MULTI raw bytes
+						for _, qCmd := range clientState.queuedCommands { commandsToPropagate = append(commandsToPropagate, qCmd.Raw) }
+						commandsToPropagate = append(commandsToPropagate, []byte("*1\r\n$4\r\nEXEC\r\n")) // Placeholder for actual EXEC raw bytes
 					}
 
 					for i, qc := range clientState.queuedCommands {
 						var cmdResp interface{}; cmdWriteInExec := false; currentCmdModKeyInExec := ""
-						// Re-process commands for EXEC
 						switch qc.Name {
 						case "SET":
 							if len(qc.Args) < 2 { cmdResp = fmt.Errorf("ERR wrong number of arguments for 'set' command in EXEC") } else {
-								keyInExec, valueInExec := qc.Args[0], qc.Args[1]; setOpts := database.SetOptions{}; getOptInExec := false
-								// Simplified: no parsing of NX/XX/GET options for commands within EXEC for now.
-								// A full impl would parse qc.Args[2:]
+								keyInExec, valueInExec := qc.Args[0], qc.Args[1]; setOpts := database.SetOptions{};
+								// Note: Simplification - queued SET does not parse/apply NX/XX/GET from its own args for now.
 								setResult := db.Set(keyInExec, valueInExec, setOpts)
-								if !setResult.DidSet { cmdResp = nil /* Or specific error if NX/XX were hypothetically parsed and failed */ } else {
-									cmdWriteInExec = true; currentCmdModKeyInExec = keyInExec
-									if getOptInExec { if setResult.Existed && setResult.OldValue != nil { /* ... serialize old value ...*/ } else { cmdResp = nil }
-									} else { cmdResp = "OK" }
-								}
+								if !setResult.DidSet { cmdResp = nil
+								} else { cmdResp = "OK"; cmdWriteInExec = true; currentCmdModKeyInExec = keyInExec }
 							}
 						case "GET":
 							if len(qc.Args) != 1 { cmdResp = fmt.Errorf("ERR wrong number of arguments for 'get' command")} else {
@@ -396,30 +387,25 @@ func handleConnection(conn net.Conn, db *database.DataStore) {
 							if len(qc.Args) == 0 {cmdResp = "PONG"} else if len(qc.Args) == 1 { cmdResp = []byte(qc.Args[0])} else {cmdResp = fmt.Errorf("ERR wrong number of arguments for 'ping' command")}
 						case "INCR":
 							if len(qc.Args) != 1 {cmdResp = fmt.Errorf("ERR wrong number of arguments for 'incr' command")} else {
-							val, err := db.Incr(qc.Args[0], 1); if err != nil {cmdResp = err} else {cmdResp = val}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
+							val, errDbI := db.Incr(qc.Args[0], 1); if errDbI != nil {cmdResp = errDbI} else {cmdResp = val}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
 						case "DECR":
 							if len(qc.Args) != 1 {cmdResp = fmt.Errorf("ERR wrong number of arguments for 'decr' command")} else {
-							val, err := db.Incr(qc.Args[0], -1); if err != nil {cmdResp = err} else {cmdResp = val}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
+							val, errDbD := db.Incr(qc.Args[0], -1); if errDbD != nil {cmdResp = errDbD} else {cmdResp = val}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
 						case "INCRBY":
 							if len(qc.Args) != 2 {cmdResp = fmt.Errorf("ERR wrong number of arguments for 'incrby' command")} else {
 							incrVal, errPI := strconv.ParseInt(qc.Args[1], 10, 64); if errPI != nil {cmdResp = fmt.Errorf("ERR value is not an integer or out of range")} else {
-							val, errDb := db.Incr(qc.Args[0], incrVal); if errDb != nil {cmdResp = errDb} else {cmdResp = val}}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
+							val, errDbIB := db.Incr(qc.Args[0], incrVal); if errDbIB != nil {cmdResp = errDbIB} else {cmdResp = val}}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
 						case "DECRBY":
 							if len(qc.Args) != 2 {cmdResp = fmt.Errorf("ERR wrong number of arguments for 'decrby' command")} else {
 							decrVal, errPI := strconv.ParseInt(qc.Args[1], 10, 64); if errPI != nil {cmdResp = fmt.Errorf("ERR value is not an integer or out of range")} else {
-							val, errDb := db.Incr(qc.Args[0], -decrVal); if errDb != nil {cmdResp = errDb} else {cmdResp = val}}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
+							val, errDbDB := db.Incr(qc.Args[0], -decrVal); if errDbDB != nil {cmdResp = errDbDB} else {cmdResp = val}}; cmdWriteInExec = true; currentCmdModKeyInExec = qc.Args[0]}
 						default: cmdResp = fmt.Errorf("ERR unknown command '%s' in EXEC", qc.Name)
 						}
 						execResponses[i] = cmdResp
-						if cmdWriteInExec { if _, isErr := cmdResp.(error); !isErr { /* successfulWriteCmdsInExec = append(successfulWriteCmdsInExec, qc) // Not strictly needed if propagating all original */ } }
+						// Note: successfulWriteCmdsInExec not used if propagating all original commands
 						if currentCmdModKeyInExec != "" { keysModifiedInTx[currentCmdModKeyInExec] = struct{}{} }
 					}
 					response = execResponses
-					if serverState.role == RoleMaster && len(clientState.queuedCommands) > 0 {
-						commandsToPropagate = append(commandsToPropagate, []byte("*1\r\n$5\r\nMULTI\r\n")) // TODO: Store original MULTI raw bytes
-						for _, qCmd := range clientState.queuedCommands { commandsToPropagate = append(commandsToPropagate, qCmd.Raw) }
-						commandsToPropagate = append(commandsToPropagate, []byte("*1\r\n$4\r\nEXEC\r\n")) // TODO: Store original EXEC raw bytes
-					}
 					for k := range keysModifiedInTx { notifyWatchers(k) }
 				}
 				clientState.queuedCommands = make([]QueuedCommand, 0); unwatchKeys(&clientState, conn)
@@ -559,5 +545,3 @@ func handleConnection(conn net.Conn, db *database.DataStore) {
 		}
 	}
 }
-
-[end of main.go]

@@ -9,6 +9,7 @@ import (
 	"strings" // For error checking in TestRDBVersionHandling, TestLoadEmptyRDBFile
 	"testing"
 	"time"
+	"io"      // For io.EOF
 )
 
 // Helper to create a temporary RDB file path for tests
@@ -376,4 +377,150 @@ func TestRDBSaveLoad_KeyTypeConflict(t *testing.T) {
     if sOk {
         t.Errorf("Expected 'conflictkey' not to be loaded as a string, but got string value: %v", sVal)
     }
+}
+
+func TestRDBSave_TypeErrors(t *testing.T) {
+	rdbFile := tempRDBFile(t)
+	defer os.Remove(rdbFile)
+
+	dsSave := NewDataStore()
+
+	// Mock GetAllPersistableData to return an entry with a bad value type
+	// This requires a bit of a workaround as we can't easily modify DataStore's internal GetAllPersistableData behavior for one test.
+	// Instead, we'll add a key with an unsupported type directly to ds.data and then call ds.GetAllPersistableData()
+	// and then modify it, or we directly construct the map to pass to Save.
+	// For simplicity, let's test the Save function's internal logic by providing a problematic entry.
+	// This means we are not testing GetAllPersistableData directly here but the Save logic.
+
+	// This approach doesn't work because Save calls ds.GetAllPersistableData() internally.
+	// We need to ensure ds.GetAllPersistableData() would produce such an entry.
+	// Let's try to add an integer to ds.data, which GetAllPersistableData will pick up as RDBStringValueType.
+
+	dsSave.mu.Lock()
+	dsSave.data["baddatatype"] = 12345 // Integer, not string or []byte
+	dsSave.mu.Unlock()
+
+	err := Save(dsSave, rdbFile)
+	if err == nil {
+		t.Errorf("Save() with bad string data type: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "invalid string value type for key 'baddatatype'") {
+		t.Errorf("Save() with bad string data type: got error %q, want error containing 'invalid string value type'", err.Error())
+	}
+	// Clear the bad data
+	dsSave.mu.Lock()
+	delete(dsSave.data, "baddatatype")
+	dsSave.mu.Unlock()
+
+	// Now test for bad hash data type
+	dsSave.mu.Lock()
+	// Add a key to ds.Hashes that GetAllPersistableData will pick up, then replace its value with bad type
+	// This is tricky. Instead, let's test the path where entry.Value for a hash is not map[string]string.
+	// The current GetAllPersistableData returns map[string]string directly from ds.Hashes.
+	// So, to test this, Save would need to be passed a map where one entry has a bad hash value type.
+	// This means we would need a custom ds.GetAllPersistableData for this test, or make Save more public.
+
+	// Let's refine: The type assertion is on entry.Value.
+	// GetAllPersistableData for RDBStringValueType puts ds.data[key] into Value.
+	// If ds.data[key] is an int, Save will find entry.Type = RDBStringValueType, entry.Value = int(12345)
+	// Then `stringValue, ok := entry.Value.(string)` will have ok=false.
+	// Then `byteValue, okByte := entry.Value.([]byte)` will have okByte=false.
+	// Then it errors. This is what the above test covers.
+
+	// For RDBHashValueType:
+	// GetAllPersistableData puts ds.Hashes[key] (which is map[string]string) into Value.
+	// So `hashValue, ok := entry.Value.(map[string]string)` should always be true if Type is RDBHashValueType.
+	// To test this error path in Save, entry.Value would have to be something else *despite*
+	// entry.Type being RDBHashValueType. This implies GetAllPersistableData is inconsistent.
+	// So this specific error path in Save for hashes is harder to trigger if GetAllPersistableData is correct.
+	// The current structure means GetAllPersistableData is responsible for providing correctly typed values.
+	// The check in Save `if !ok` for hashValue is more of a safeguard.
+
+	// We can test an unknown type during save:
+	// Create a custom PersistableEntry map
+	customData := make(map[string]PersistableEntry)
+	customData["unknownTypeKey"] = PersistableEntry{
+		Value: "some value",
+		Type:  RDBValueType(99), // Unknown type
+		ExpiryTime: time.Time{},
+	}
+
+	// To test Save with this customData, we'd need to modify Save or pass data directly.
+	// This suggests unit testing the serialization of individual types might be better.
+	// For now, the string type error is testable as shown.
+	// The "unknown value type %d for key '%s' during save" can be tested if we can inject a custom entry.
+	// Given current structure, this path is hard to reach without modifying GetAllPersistableData.
+	// Let's skip testing this specific error path for now as it implies inconsistency from GetAllPersistableData.
+
+	// Test unknown type by manually creating a problematic DataStore state for GetAllPersistableData to pick up.
+	// This is difficult because GetAllPersistableData assigns specific types.
+	// A direct test of Save's default case would require mocking GetAllPersistableData or passing a map.
+	// However, if we add a new RDBValueType and don't handle it in Save, that would trigger it.
+	// For now, this error condition in Save is hard to test cleanly without more significant refactoring.
+}
+
+func TestRDLoad_CorruptedOrInvalidContent(t *testing.T) {
+	rdbFile := tempRDBFile(t)
+	defer os.Remove(rdbFile)
+
+	// Test 1: File with valid magic and version, but unknown value type
+	file, _ := os.Create(rdbFile)
+	writer := bufio.NewWriter(file)
+	writer.WriteString(rdbMagicString)
+	binary.Write(writer, binary.LittleEndian, uint32(rdbVersion))
+
+	// Write an unknown value type
+	unknownValueType := RDBValueType(99)
+	writer.WriteByte(byte(unknownValueType))
+
+	// Write a dummy key to make it attempt to process the unknown type
+	dummyKey := "somekey"
+	keyBytes := []byte(dummyKey)
+	binary.Write(writer, binary.LittleEndian, uint32(len(keyBytes)))
+	writer.Write(keyBytes)
+	// No need to write value as it should fail on the type marker.
+
+	writer.Flush()
+	file.Close()
+
+	_, err := Load(rdbFile)
+	if err == nil {
+		t.Errorf("Load() with unknown value type: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "unknown RDB value type 99 for key 'somekey'") {
+		t.Errorf("Load() with unknown value type: got error %q, want specific message", err.Error())
+	}
+
+	// Test 2: File ends prematurely after ExpiryTimeMs opcode
+	file, _ = os.Create(rdbFile)
+	writer = bufio.NewWriter(file)
+	writer.WriteString(rdbMagicString)
+	binary.Write(writer, binary.LittleEndian, uint32(rdbVersion))
+	writer.WriteByte(byte(rdbOpcodeExpireTimeMs)) // Write opcode
+	// Do not write the 8-byte timestamp, simulate premature EOF
+	writer.Flush()
+	file.Close()
+
+	_, err = Load(rdbFile)
+	if err == nil {
+		t.Errorf("Load() with premature EOF after ExpireTimeMs: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "failed to read expiry timestamp") && !strings.Contains(err.Error(), io.EOF.Error()){
+		// Error might be io.EOF directly from binary.Read or wrapped.
+		t.Errorf("Load() with premature EOF after ExpireTimeMs: got error %q, want error about reading timestamp or EOF", err.Error())
+	}
+
+	// Test 3: File ends prematurely after ValueType marker (before key length)
+	file, _ = os.Create(rdbFile)
+	writer = bufio.NewWriter(file)
+	writer.WriteString(rdbMagicString)
+	binary.Write(writer, binary.LittleEndian, uint32(rdbVersion))
+	writer.WriteByte(byte(RDBStringValueType)) // Write type
+	// Do not write key length or key data
+	writer.Flush()
+	file.Close()
+
+	_, err = Load(rdbFile)
+	if err == nil {
+		t.Errorf("Load() with premature EOF after ValueType: expected error, got nil")
+	} else if !strings.Contains(err.Error(), "failed to read key length") && !strings.Contains(err.Error(), io.EOF.Error()){
+		t.Errorf("Load() with premature EOF after ValueType: got error %q, want error about reading key length or EOF", err.Error())
+	}
 }
